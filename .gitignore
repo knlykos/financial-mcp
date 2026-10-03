@@ -1,0 +1,15 @@
+__pycache__/
+*.py[oc]
+build/
+dist/
+*.egg-info
+.venv/
+
+# Secrets and personal financial data
+.simplefin-access-url
+.env
+data/
+
+# Local plan and personal rules (contain personal details)
+PLAN-finanzas-mcp.md
+local_rules.json

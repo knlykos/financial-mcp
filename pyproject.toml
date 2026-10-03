@@ -1,0 +1,21 @@
+[project]
+name = "personal-financial-mcp"
+version = "0.1.0"
+description = "MCP server for personal finance data via SimpleFIN"
+readme = "README.md"
+authors = [
+    { name = "nefil", email = "nefi.lopezg@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp[cli]>=2.3.0",
+]
+
+[project.scripts]
+personal-financial-mcp = "personal_financial_mcp:main"
+pfm-setup = "personal_financial_mcp.setup:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
