@@ -10,6 +10,7 @@ from typing import Any
 
 from .normalize import SEED_ALIASES, Alias, compile_aliases, normalize_payee
 from .simplefin import PROJECT_ROOT
+from . import categories
 from .transfers import match_internal_transfers
 
 DB_PATH = PROJECT_ROOT / "data" / "finance.db"
@@ -84,7 +85,39 @@ def _m3_internal_transfers(conn: sqlite3.Connection) -> None:
     match_internal_transfers(conn)
 
 
-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_m1_base, _m2_payee_normalized, _m3_internal_transfers]
+def _m4_categories(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS categories (
+            id     INTEGER PRIMARY KEY,
+            name   TEXT NOT NULL UNIQUE,
+            parent TEXT,
+            kind   TEXT NOT NULL CHECK (kind IN ('income', 'expense', 'transfer', 'debt')),
+            source TEXT NOT NULL DEFAULT 'user'  -- seed | local | user
+        );
+
+        CREATE TABLE IF NOT EXISTS category_rules (
+            id          INTEGER PRIMARY KEY,
+            match_field TEXT NOT NULL,  -- payee_normalized | payee | description | memo
+            match_type  TEXT NOT NULL CHECK (match_type IN ('exact', 'contains', 'regex')),
+            pattern     TEXT NOT NULL,
+            category_id INTEGER NOT NULL REFERENCES categories(id),
+            direction   TEXT NOT NULL DEFAULT 'any' CHECK (direction IN ('any', 'in', 'out')),
+            priority    INTEGER NOT NULL DEFAULT 10,  -- lower wins
+            source      TEXT NOT NULL DEFAULT 'user',  -- seed | local | user
+            created_at  TEXT NOT NULL
+        );
+        """
+    )
+    _add_column(conn, "transactions", "category_id", "INTEGER REFERENCES categories(id)")
+    _add_column(conn, "transactions", "category_source", "TEXT NOT NULL DEFAULT 'none'")  # rule | manual | none
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category_id)")
+    # Seeding and the first categorization happen in _refresh_derived, right after migrations.
+
+
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
+    _m1_base, _m2_payee_normalized, _m3_internal_transfers, _m4_categories,
+]
 
 
 def _backup(conn: sqlite3.Connection, version: int) -> Path:
@@ -166,6 +199,17 @@ def renormalize_all(conn: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def _refresh_derived(conn: sqlite3.Connection) -> None:
+    """Recompute everything derived from raw transactions, once per process.
+
+    Cheap at personal-finance scale, and it repairs rows written by an older version of the server.
+    """
+    _sync_aliases(conn)
+    match_internal_transfers(conn)
+    categories.sync_seed_rules(conn, _load_local_rules())
+    categories.recategorize(conn)
+
+
 # --- Connection -----------------------------------------------------------------------------------
 
 _initialized: set[Path] = set()
@@ -180,7 +224,7 @@ def connect() -> Iterator[sqlite3.Connection]:
     try:
         if DB_PATH not in _initialized:
             _migrate(conn)
-            _sync_aliases(conn)
+            _refresh_derived(conn)
             conn.commit()
             _initialized.add(DB_PATH)
         yield conn
@@ -279,11 +323,14 @@ def query_transactions(
     include_pending: bool = True,
     limit: int = 500,
     exclude_internal: bool = False,
+    category_id: int | None = None,
+    uncategorized: bool = False,
 ) -> list[dict[str, Any]]:
     sql = """
         SELECT t.date, t.amount, t.description, t.payee, t.payee_normalized, t.memo, t.pending,
-               a.name AS account, t.account_id, t.id, t.is_internal_transfer, t.transfer_pair_id
-        FROM transactions t JOIN accounts a ON a.id = t.account_id
+               a.name AS account, t.account_id, t.id, t.is_internal_transfer, t.transfer_pair_id,
+               c.name AS category, t.category_source
+        FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN categories c ON c.id = t.category_id
         WHERE t.date BETWEEN ? AND ?
     """
     params: list[Any] = [start.isoformat(), end.isoformat()]
@@ -297,6 +344,11 @@ def query_transactions(
         sql += " AND t.pending = 0"
     if exclude_internal:
         sql += " AND t.is_internal_transfer = 0"
+    if category_id is not None:
+        sql += " AND t.category_id = ?"
+        params.append(category_id)
+    if uncategorized:
+        sql += " AND t.category_id IS NULL"
     sql += " ORDER BY t.date DESC LIMIT ?"
     params.append(limit)
     return [
