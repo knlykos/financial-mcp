@@ -10,6 +10,7 @@ from typing import Any
 
 from .normalize import SEED_ALIASES, Alias, compile_aliases, normalize_payee
 from .simplefin import PROJECT_ROOT
+from .transfers import match_internal_transfers
 
 DB_PATH = PROJECT_ROOT / "data" / "finance.db"
 # Personal aliases/rules (employer, own name...) that must stay out of git.
@@ -76,7 +77,14 @@ def _m2_payee_normalized(conn: sqlite3.Connection) -> None:
     # Backfill happens in _sync_aliases, which runs right after migrations.
 
 
-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_m1_base, _m2_payee_normalized]
+def _m3_internal_transfers(conn: sqlite3.Connection) -> None:
+    _add_column(conn, "transactions", "is_internal_transfer", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "transactions", "transfer_pair_id", "TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_pair ON transactions(transfer_pair_id)")
+    match_internal_transfers(conn)
+
+
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_m1_base, _m2_payee_normalized, _m3_internal_transfers]
 
 
 def _backup(conn: sqlite3.Connection, version: int) -> Path:
@@ -270,10 +278,11 @@ def query_transactions(
     search: str | None = None,
     include_pending: bool = True,
     limit: int = 500,
+    exclude_internal: bool = False,
 ) -> list[dict[str, Any]]:
     sql = """
         SELECT t.date, t.amount, t.description, t.payee, t.payee_normalized, t.memo, t.pending,
-               a.name AS account, t.account_id, t.id
+               a.name AS account, t.account_id, t.id, t.is_internal_transfer, t.transfer_pair_id
         FROM transactions t JOIN accounts a ON a.id = t.account_id
         WHERE t.date BETWEEN ? AND ?
     """
@@ -286,6 +295,16 @@ def query_transactions(
         params += [f"%{search}%"] * 4
     if not include_pending:
         sql += " AND t.pending = 0"
+    if exclude_internal:
+        sql += " AND t.is_internal_transfer = 0"
     sql += " ORDER BY t.date DESC LIMIT ?"
     params.append(limit)
-    return [dict(r) | {"amount": round(r["amount"], 2), "pending": bool(r["pending"])} for r in conn.execute(sql, params)]
+    return [
+        dict(r)
+        | {
+            "amount": round(r["amount"], 2),
+            "pending": bool(r["pending"]),
+            "is_internal_transfer": bool(r["is_internal_transfer"]),
+        }
+        for r in conn.execute(sql, params)
+    ]

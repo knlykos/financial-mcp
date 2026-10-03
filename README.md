@@ -23,7 +23,7 @@ claude mcp add finanzas -- uv run --directory C:/Users/nefil/Documents/dev/perso
 |---|---|
 | `list_accounts` | Cuentas con saldo actual y disponible (`refresh=true` para pedirlos al banco). |
 | `sync_transactions` | Descarga hasta 90 días de transacciones a la base local. |
-| `get_transactions` | Consulta la base local por fechas, cuenta o texto. Parámetros opcionales `fields` y `compact` para respuestas ligeras. |
+| `get_transactions` | Consulta la base local por fechas, cuenta o texto. Parámetros opcionales `fields`, `compact` y `exclude_internal`. |
 
 Cada transacción incluye `payee_normalized`: el nombre del comercio limpio (sin ciudad, prefijos ni referencias) y unificado con alias, ideal para agrupar. Ejemplos:
 
@@ -32,6 +32,17 @@ Cada transacción incluye `payee_normalized`: el nombre del comercio limpio (sin
 get_transactions({"start_date": "2026-07-01", "fields": ["date", "amount", "payee_normalized"]})
 // Todo menos la descripción cruda y el memo
 get_transactions({"compact": true, "search": "costco"})
+```
+
+### Transferencias internas
+
+El dinero que mueves entre tus propias cuentas no es ingreso ni gasto. Después de cada sync se emparejan: una salida en una cuenta propia y una entrada del mismo monto en otra cuenta propia, con 2 días o menos de diferencia (si hay varios candidatos, gana la fecha más cercana). Ambas quedan con `is_internal_transfer: true` y el mismo `transfer_pair_id`.
+
+Solo se consideran movimientos tipo transferencia (`TRANSFER`/`XFER`), y si la descripción menciona una cuenta (`XXXXXX1234`) que no es tuya, se trata como transferencia a un tercero. Las cuentas propias salen de la tabla `accounts`.
+
+```jsonc
+// Solo ingresos y gastos reales
+get_transactions({"start_date": "2026-08-01", "end_date": "2026-08-31", "exclude_internal": true})
 ```
 
 SimpleFIN solo da ~90 días de historial por consulta, actualiza los datos ~1 vez al día y limita las consultas diarias. Por eso todo se guarda en `data/finance.db`: sincronizando regularmente, el historial crece más allá de esos 90 días.
@@ -61,6 +72,7 @@ Los alias genéricos (Uber, Apple, Costco...) viven en `normalize.py`. Los que c
 - `src/personal_financial_mcp/simplefin.py`: cliente del protocolo SimpleFIN.
 - `src/personal_financial_mcp/db.py`: esquema, migraciones y consultas SQLite.
 - `src/personal_financial_mcp/normalize.py`: limpieza de nombres de comercio y alias.
+- `src/personal_financial_mcp/transfers.py`: emparejamiento de transferencias internas.
 - `src/personal_financial_mcp/server.py`: herramientas MCP. Las nuevas funciones de análisis van aquí.
 - `src/personal_financial_mcp/setup.py`: canje del setup token.
 

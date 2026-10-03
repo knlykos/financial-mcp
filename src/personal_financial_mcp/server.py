@@ -6,10 +6,12 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from . import db
+from .transfers import match_internal_transfers
 from .simplefin import fetch_accounts
 
 TRANSACTION_FIELDS = [
     "date", "amount", "description", "payee", "payee_normalized", "memo", "pending", "account", "account_id", "id",
+    "is_internal_transfer", "transfer_pair_id",
 ]
 
 mcp = MCPServer(
@@ -42,11 +44,13 @@ def sync_transactions(
     with db.connect() as conn:
         db.upsert_accounts(conn, data["accounts"])
         changed = db.upsert_transactions(conn, data["accounts"])
+        pairs = match_internal_transfers(conn)
         total = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
     return {
         "accounts": len(data["accounts"]),
         "downloaded": sum(len(a.get("transactions", [])) for a in data["accounts"]),
         "rows_written": changed,
+        "internal_transfer_pairs": pairs,
         "total_stored": total,
         "simplefin_errors": data.get("errors", []),
     }
@@ -65,19 +69,25 @@ def get_transactions(
         Field(description=f"Only return these fields, e.g. ['date','amount','payee_normalized']. Valid: {TRANSACTION_FIELDS}."),
     ] = None,
     compact: Annotated[bool, Field(description="Omit the long raw description and memo fields.")] = False,
+    exclude_internal: Annotated[
+        bool, Field(description="Leave out transfers between the user's own accounts (not real income/spending).")
+    ] = False,
 ) -> dict[str, Any]:
     """Query transactions stored locally. Amounts are negative for money out, positive for money in.
 
     Reads from the local database; run sync_transactions first if it is empty or out of date.
     payee_normalized is a cleaned merchant name, better for grouping than payee or description.
     Use fields and/or compact to keep responses small when listing many transactions.
+    is_internal_transfer marks money moved between the user's own accounts; transfer_pair_id links both sides.
     """
     if unknown := set(fields or []) - set(TRANSACTION_FIELDS):
         raise ToolError(f"Unknown fields {sorted(unknown)}. Valid fields: {TRANSACTION_FIELDS}")
     end = end_date or date.today()
     start = start_date or end - timedelta(days=30)
     with db.connect() as conn:
-        rows = db.query_transactions(conn, start, end, account_ids, search, include_pending, limit)
+        rows = db.query_transactions(
+            conn, start, end, account_ids, search, include_pending, limit, exclude_internal=exclude_internal
+        )
         last_sync = conn.execute("SELECT MAX(synced_at) FROM accounts").fetchone()[0]
 
     keep = [f for f in (fields or TRANSACTION_FIELDS) if not (compact and f in ("description", "memo"))]
