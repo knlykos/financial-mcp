@@ -23,15 +23,45 @@ claude mcp add finanzas -- uv run --directory C:/Users/nefil/Documents/dev/perso
 |---|---|
 | `list_accounts` | Cuentas con saldo actual y disponible (`refresh=true` para pedirlos al banco). |
 | `sync_transactions` | Descarga hasta 90 días de transacciones a la base local. |
-| `get_transactions` | Consulta la base local por fechas, cuenta o texto. |
+| `get_transactions` | Consulta la base local por fechas, cuenta o texto. Parámetros opcionales `fields` y `compact` para respuestas ligeras. |
+
+Cada transacción incluye `payee_normalized`: el nombre del comercio limpio (sin ciudad, prefijos ni referencias) y unificado con alias, ideal para agrupar. Ejemplos:
+
+```jsonc
+// Solo 3 campos: ~5x más pequeño que la respuesta completa
+get_transactions({"start_date": "2026-07-01", "fields": ["date", "amount", "payee_normalized"]})
+// Todo menos la descripción cruda y el memo
+get_transactions({"compact": true, "search": "costco"})
+```
 
 SimpleFIN solo da ~90 días de historial por consulta, actualiza los datos ~1 vez al día y limita las consultas diarias. Por eso todo se guarda en `data/finance.db`: sincronizando regularmente, el historial crece más allá de esos 90 días.
+
+## Alias personales (`local_rules.json`)
+
+Los alias genéricos (Uber, Apple, Costco...) viven en `normalize.py`. Los que contienen datos personales (tu empleador, tu nombre) van en `local_rules.json`, que no se sube a git:
+
+```json
+{
+  "payee_aliases": [
+    {"pattern": "^Acme Corp Payroll", "normalized": "Acme Payroll"},
+    {"pattern": "ONLINE TRANSFER (TO|FROM) DOE J\\b", "normalized": "Transfer Doe J", "field": "description"}
+  ]
+}
+```
+
+`pattern` es una expresión regular sin distinguir mayúsculas. Por defecto se compara con el payee de SimpleFIN; con `"field": "description"` se compara con la descripción cruda del banco. Los alias locales tienen prioridad sobre los genéricos y, al cambiar el archivo, todo se renormaliza en el siguiente arranque.
+
+## Base de datos y pruebas
+
+- El esquema se migra solo al arrancar (`PRAGMA user_version`); antes de migrar se guarda una copia en `data/backups/`.
+- Pruebas (solo datos inventados): `uv run pytest`
 
 ## Estructura
 
 - `src/personal_financial_mcp/simplefin.py`: cliente del protocolo SimpleFIN.
-- `src/personal_financial_mcp/db.py`: esquema SQLite y consultas.
+- `src/personal_financial_mcp/db.py`: esquema, migraciones y consultas SQLite.
+- `src/personal_financial_mcp/normalize.py`: limpieza de nombres de comercio y alias.
 - `src/personal_financial_mcp/server.py`: herramientas MCP. Las nuevas funciones de análisis van aquí.
 - `src/personal_financial_mcp/setup.py`: canje del setup token.
 
-`.simplefin-access-url` y `data/` están en `.gitignore`: contienen tus credenciales y tus datos financieros.
+`.simplefin-access-url`, `local_rules.json` y `data/` están en `.gitignore`: contienen tus credenciales y tus datos financieros.

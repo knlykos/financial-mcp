@@ -19,3 +19,9 @@ pfm-setup = "personal_financial_mcp.setup:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = ["pytest>=9.1.1"]

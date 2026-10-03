@@ -2,10 +2,15 @@ from datetime import date, datetime, timedelta
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from . import db
 from .simplefin import fetch_accounts
+
+TRANSACTION_FIELDS = [
+    "date", "amount", "description", "payee", "payee_normalized", "memo", "pending", "account", "account_id", "id",
+]
 
 mcp = MCPServer(
     name="personal-financial-mcp",
@@ -55,16 +60,29 @@ def get_transactions(
     search: Annotated[str | None, Field(description="Case-insensitive text match on description, payee or memo.")] = None,
     include_pending: bool = True,
     limit: Annotated[int, Field(ge=1, le=5000)] = 500,
+    fields: Annotated[
+        list[str] | None,
+        Field(description=f"Only return these fields, e.g. ['date','amount','payee_normalized']. Valid: {TRANSACTION_FIELDS}."),
+    ] = None,
+    compact: Annotated[bool, Field(description="Omit the long raw description and memo fields.")] = False,
 ) -> dict[str, Any]:
     """Query transactions stored locally. Amounts are negative for money out, positive for money in.
 
     Reads from the local database; run sync_transactions first if it is empty or out of date.
+    payee_normalized is a cleaned merchant name, better for grouping than payee or description.
+    Use fields and/or compact to keep responses small when listing many transactions.
     """
+    if unknown := set(fields or []) - set(TRANSACTION_FIELDS):
+        raise ToolError(f"Unknown fields {sorted(unknown)}. Valid fields: {TRANSACTION_FIELDS}")
     end = end_date or date.today()
     start = start_date or end - timedelta(days=30)
     with db.connect() as conn:
         rows = db.query_transactions(conn, start, end, account_ids, search, include_pending, limit)
         last_sync = conn.execute("SELECT MAX(synced_at) FROM accounts").fetchone()[0]
+
+    keep = [f for f in (fields or TRANSACTION_FIELDS) if not (compact and f in ("description", "memo"))]
+    if keep != TRANSACTION_FIELDS:
+        rows = [{k: r[k] for k in keep} for r in rows]
     return {"count": len(rows), "last_synced": last_sync, "transactions": rows}
 
 
