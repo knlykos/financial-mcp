@@ -128,3 +128,27 @@ def test_list_categories_counts_uncategorized(synced):
     rows = {c["name"]: c for c in server.list_categories()}
     assert rows["(sin categoría)"]["transactions"] == 1
     assert rows["Transferencia interna"]["total"] == 0
+
+
+def test_card_interest_cashback_and_dealer(tmp_db, fake_simplefin):
+    fake_simplefin.accounts = [
+        make_account("ACC-A", "CHECKING ...1111 (1111)", "100.00", [
+            make_tx("loan", 1, "-436.38", "NISSAN RET       Auto Loan  260908 0000000001      DOE JANE", "Nissan"),
+        ]),
+        make_account("CARD", "Platinum (5894)", "-300.00", [
+            make_tx("interest", 1, "-7.54", "INTEREST CHARGE:PURCHASES", "Interest Charge"),
+            make_tx("cashback", 2, "24.72", "CREDIT-CASH BACK REWARD", "Cashback"),
+            make_tx("dealer", 3, "-27.64", "MOSSY NISSAN CHULA VIS", "Nissan"),
+            make_tx("parts", 4, "-55.00", "PAYPAL *AUTOZONEINC", "Autozoneinc"),
+            make_tx("mcd", 5, "-8.19", "MC DONALD S BELLAS A", "Donald S Bellas"),
+            make_tx("motel", 6, "-43.06", "MOTEL LAS PALMAS TIJUANA", "Motel Las Palmas"),
+        ]),
+    ]
+    server.sync_transactions()
+    assert cat("loan")[0] == "Préstamo auto"
+    assert cat("interest")[0] == "Intereses"
+    assert cat("cashback")[0] == "Otros ingresos"
+    assert cat("dealer") == (None, "none")  # a bare "Nissan" purchase is not a loan payment
+    assert cat("parts")[0] == "Mantenimiento auto"
+    assert cat("mcd")[0] == "Comida fuera"
+    assert cat("motel")[0] == "Hospedaje"

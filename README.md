@@ -44,6 +44,8 @@ El dinero que mueves entre tus propias cuentas no es ingreso ni gasto. Después 
 
 Solo se consideran movimientos tipo transferencia (`TRANSFER`/`XFER`), y si la descripción menciona una cuenta (`XXXXXX1234`) que no es tuya, se trata como transferencia a un tercero. Las cuentas propias salen de la tabla `accounts`.
 
+**Tarjetas de crédito.** Cada cuenta tiene `kind`: `credit` o `depository`. SimpleFIN no dice el tipo, así que se deduce del nombre ("Quicksilver", "Card", "Checking"...) o, si no hay pista, de un saldo negativo. Solo se deduce al crear la cuenta; si se equivoca, corrígelo en la tabla `accounts` y se respeta. Un pago a una tarjeta conectada también es transferencia interna aunque diga `PMT`/`PYMT`/`PAYMENT` en vez de `TRANSFER`, con hasta 4 días de diferencia (Apple Card registra el pago antes que Wells Fargo). Los pagos a tarjetas no conectadas siguen en "Tarjetas de crédito" (deuda), y las compras con la tarjeta cuentan como gasto en su categoría.
+
 ```jsonc
 // Solo ingresos y gastos reales
 get_transactions({"start_date": "2026-08-01", "end_date": "2026-08-31", "exclude_internal": true})

@@ -24,6 +24,7 @@ SEED_ALIASES: list[tuple[str, str]] = [
     (r"\bANTHROPIC\b", "Anthropic"),
     (r"\bREMITLY\b|\bRMTLY\*", "Remitly"),
     (r"\bCALIMAX\b", "Calimax"),
+    (r"\bAUTOZONE", "AutoZone"),  # "PAYPAL *AUTOZONEINC"
     (r"^San Diego Gas & Electric$|SD GAS & ELEC", "San Diego Gas & Electric"),
 ]
 

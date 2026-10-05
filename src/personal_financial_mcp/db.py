@@ -1,6 +1,7 @@
 """Local SQLite store, so history accumulates beyond SimpleFIN's ~90-day window."""
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -82,7 +83,7 @@ def _m3_internal_transfers(conn: sqlite3.Connection) -> None:
     _add_column(conn, "transactions", "is_internal_transfer", "INTEGER NOT NULL DEFAULT 0")
     _add_column(conn, "transactions", "transfer_pair_id", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_pair ON transactions(transfer_pair_id)")
-    match_internal_transfers(conn)
+    # Matching happens in _refresh_derived, after all migrations (it needs accounts.kind from _m5).
 
 
 def _m4_categories(conn: sqlite3.Connection) -> None:
@@ -115,8 +116,33 @@ def _m4_categories(conn: sqlite3.Connection) -> None:
     # Seeding and the first categorization happen in _refresh_derived, right after migrations.
 
 
+_DEPOSITORY_WORDS = re.compile(r"\b(CHECKING|SAVINGS|MONEY MARKET)\b", re.I)
+_CREDIT_WORDS = re.compile(r"\b(CARD|CREDIT|QUICKSILVER|PLATINUM|SAVOR|VENTURE|VISA|MASTERCARD|AMEX)\b", re.I)
+
+
+def infer_account_kind(name: str | None, institution: str | None, balance: float | None) -> str:
+    """'credit' for credit cards, else 'depository'. SimpleFIN doesn't report the account type, so guess it."""
+    text = f"{name or ''} {institution or ''}"
+    if _DEPOSITORY_WORDS.search(text):
+        return "depository"
+    if _CREDIT_WORDS.search(text):
+        return "credit"
+    return "credit" if (balance or 0) < 0 else "depository"
+
+
+def _m5_account_kind(conn: sqlite3.Connection) -> None:
+    _add_column(conn, "accounts", "kind", "TEXT NOT NULL DEFAULT 'depository'")  # depository | credit
+    conn.executemany(
+        "UPDATE accounts SET kind = ? WHERE id = ?",
+        [
+            (infer_account_kind(r["name"], r["institution"], r["balance"]), r["id"])
+            for r in conn.execute("SELECT id, name, institution, balance FROM accounts")
+        ],
+    )
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
-    _m1_base, _m2_payee_normalized, _m3_internal_transfers, _m4_categories,
+    _m1_base, _m2_payee_normalized, _m3_internal_transfers, _m4_categories, _m5_account_kind,
 ]
 
 
@@ -248,11 +274,13 @@ def _num(value: str | None) -> float | None:
 
 
 def upsert_accounts(conn: sqlite3.Connection, accounts: list[dict[str, Any]]) -> None:
+    """Insert or refresh accounts. `kind` is guessed only on insert, so a manual correction in the DB sticks."""
     now = datetime.now().isoformat(timespec="seconds")
     conn.executemany(
         """
-        INSERT INTO accounts (id, name, institution, currency, balance, available_balance, balance_date, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO accounts (id, name, institution, currency, balance, available_balance, balance_date, synced_at,
+                              kind)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name, institution = excluded.institution, currency = excluded.currency,
             balance = excluded.balance, available_balance = excluded.available_balance,
@@ -268,6 +296,7 @@ def upsert_accounts(conn: sqlite3.Connection, accounts: list[dict[str, Any]]) ->
                 _num(a.get("available-balance")),
                 _local_date(a.get("balance-date")),
                 now,
+                infer_account_kind(a["name"], a["org"].get("name"), _num(a.get("balance"))),
             )
             for a in accounts
         ],

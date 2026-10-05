@@ -39,9 +39,11 @@ SEED_CATEGORIES: list[tuple[str, str]] = [
     ("Transporte", "expense"),
     ("Salud", "expense"),
     ("Comisiones bancarias", "expense"),
+    ("Intereses", "expense"),
     ("Envíos de dinero", "expense"),
     ("Efectivo/ATM", "expense"),
     ("Compras", "expense"),
+    ("Hospedaje", "expense"),
     (INTERNAL_TRANSFER, "transfer"),
     ("Otros", "expense"),
 ]
@@ -60,18 +62,23 @@ def _words(category: str, *words: str, direction: str = "any", field: str = "pay
 SEED_RULES: list[tuple[str, str, str, str, str]] = [
     *_words("Nómina", "Payroll", direction="in"),
     *_exact("Uber (ingreso)", "Uber Payout"),
-    *_exact("Préstamo auto", "Capital One Auto Loan", "Nissan"),
+    # Loan payments say "Auto Loan" ("NISSAN RET Auto Loan"); a bare "Nissan" is also the dealer.
+    *_exact("Préstamo auto", "Capital One Auto Loan"),
     *_words("Préstamo auto", "Auto Loan"),
+    *_words("Préstamo auto", "Auto Loan", field="description", direction="out"),
     *_exact("Seguro auto", "Progressive", "Geico", "State Farm", "Allstate"),
     *_exact("Mantenimiento auto", "AutoZone", "O'Reilly Auto Parts", "Jiffy Lube", "Pep Boys", "Firestone"),
     *_words("Mantenimiento auto", "Auto Repair", "Auto Parts", "Tire", "Tires", "Oil Change"),
     *_words("Pago de deuda", "Consolidated Credit Solutions", "Oportun", "Sunbit"),
-    *_exact("Tarjetas de crédito", "Capital One Credit Card", "Apple Credit Card"),
+    # Payments to cards not connected to SimpleFIN. Payments to connected cards become internal transfers;
+    # the card side ("in") is left uncategorized if its checking side is missing, rather than counted twice.
+    *_exact("Tarjetas de crédito", "Capital One Credit Card", "Apple Credit Card", direction="out"),
+    *_exact("Intereses", "Interest", "Interest Charge", direction="out"),
     ("description", "regex", r"PAYPAL\s+INST\s+XFER.*\bPPCR\b", "Tarjetas de crédito", "out"),
     *_exact("Servicios", "Cox Communications", "San Diego Gas & Electric", "AT&T", "Verizon", "T-Mobile"),
     *_exact(
         "Suscripciones", "Apple", "Spotify", "Microsoft", "Cloudflare", "Anthropic", "Luv Car Wash", "YouTube",
-        "Netflix", "Rocket Money Premium",
+        "Netflix", "Rocket Money Premium", "Amazon Prime",
     ),
     *_words("Comisiones bancarias", "Fee", direction="out"),
     *_exact(
@@ -82,12 +89,14 @@ SEED_RULES: list[tuple[str, str, str, str, str]] = [
     *_exact(
         "Súper", "Costco", "Walmart", "Carnival Supermarket", "Northgate Gonzalez Market", "Target", "El Super",
         "Vons", "Trader Joe's", "Smart & Final", "Grocery Outlet", "Pavillions", "Calimax", "Otay Farms Market",
+        "Whole Foods",
     ),
     *_words("Súper", "Supermarket", "Grocery", "Market"),
     *_exact(
         "Comida fuera", "McDonald's", "In-N-Out Burger", "Starbucks", "Carl's Jr.", "Del Taco", "Domino's",
-        "Jack in the Box", "Little Caesars", "Raising Cane's", "Shake Shack",
+        "Jack in the Box", "Little Caesars", "Raising Cane's", "Shake Shack", "Wendy's",
     ),
+    ("description", "regex", r"\bMC ?DONALD ?'?S\b", "Comida fuera", "out"),  # Capital One: "MC DONALD S ..."
     *_words("Comida fuera", "Taco", "Tacos", "Taco Shop", "Coffee", "Cafe", "Bakery", "Donut", "Pizza", "Burger"),
     *_exact("Gobierno/DMV", "California Department of Motor Vehicles"),
     *_words("Gobierno/DMV", "DMV"),
@@ -97,11 +106,12 @@ SEED_RULES: list[tuple[str, str, str, str, str]] = [
     *_words("Salud", "Pharmacy", "Hospital", "Medical", "Clinic"),
     *_exact("Envíos de dinero", "Remitly", "Transfer to Apple Pay"),
     *_exact("Envíos de dinero", "Zelle Transfer", direction="out"),
-    *_exact("Otros ingresos", "Zelle Transfer", "Mobile Deposit", "Cash Deposit", direction="in"),
+    *_exact("Otros ingresos", "Zelle Transfer", "Mobile Deposit", "Cash Deposit", "Cashback", direction="in"),
     *_exact("Efectivo/ATM", "ATM Withdrawal"),
+    *_words("Hospedaje", "Hotel", "Motel", "Airbnb"),
     *_exact(
         "Compras", "Amazon", "Shein", "Ikea", "The Home Depot", "Burlington", "Michaels", "MINISO", "UPS", "Steam",
-        "Humble Bundle",
+        "Humble Bundle", "TJ Maxx", "Five Below", "Harbor Freight Tools", "Guitar Center", "iFixit",
     ),
 ]
 
