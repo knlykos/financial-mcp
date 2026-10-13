@@ -124,6 +124,32 @@ def test_local_rules_file_adds_categories_and_rules(tmp_db, fake_simplefin):
     assert kinds["Pareja"] == "transfer"
 
 
+def test_rules_count_only_what_they_matched(synced):
+    rules = server.manage_rules(action="list")
+    costco = next(r for r in rules if r["pattern"] == "Costco" and r["source"] == "seed")
+    grocery = next(r for r in rules if r["pattern"] == "Grocery")  # same category, matched nothing
+    assert costco["transactions"] == 1
+    assert grocery["transactions"] == 0
+
+    server.set_category(["costco"], "Compras")  # manual: no longer counted for the rule
+    costco = next(r for r in server.manage_rules(action="list") if r["id"] == costco["id"])
+    assert costco["transactions"] == 0
+
+
+def test_zelle_note_and_unnamed_paypal_purchase(tmp_db, fake_simplefin):
+    fake_simplefin.accounts = [make_account("ACC-A", "CHECKING ...1111 (1111)", "100.00", [
+        make_tx("zelle-note", 1, "-18.00", "ZELLE TO  DOE J ON 03/01 REF # WFCT00000001 MINECRAFT REALM", "Minecraft"),
+        make_tx("paypal", 2, "-10.59", "PAYPAL           PURCHASE   260301 SOMESHOPXYZ SOM JANE DOE", "PayPal"),
+        make_tx("paypal-parts", 3, "-55.00", "PAYPAL           PURCHASE   260301 AUTOZONEINC JANE DOE", "Autozoneinc"),
+        make_tx("paypal-card", 4, "-100.00", "PAYPAL           INST XFER  260301 PPCR CC REPAYME JANE DOE", "PayPal"),
+    ])]
+    server.sync_transactions()
+    assert cat("zelle-note")[0] == "Envíos de dinero"
+    assert cat("paypal")[0] == "Compras"
+    assert cat("paypal-parts")[0] == "Mantenimiento auto"  # a known merchant behind PayPal keeps its category
+    assert cat("paypal-card")[0] == "Tarjetas de crédito"
+
+
 def test_list_categories_counts_uncategorized(synced):
     rows = {c["name"]: c for c in server.list_categories()}
     assert rows["(sin categoría)"]["transactions"] == 1
@@ -135,7 +161,7 @@ def test_card_interest_cashback_and_dealer(tmp_db, fake_simplefin):
         make_account("ACC-A", "CHECKING ...1111 (1111)", "100.00", [
             make_tx("loan", 1, "-436.38", "NISSAN RET       Auto Loan  260908 0000000001      DOE JANE", "Nissan"),
         ]),
-        make_account("CARD", "Platinum (5894)", "-300.00", [
+        make_account("CARD", "Platinum (0003)", "-300.00", [
             make_tx("interest", 1, "-7.54", "INTEREST CHARGE:PURCHASES", "Interest Charge"),
             make_tx("cashback", 2, "24.72", "CREDIT-CASH BACK REWARD", "Cashback"),
             make_tx("dealer", 3, "-27.64", "MOSSY NISSAN CHULA VIS", "Nissan"),
@@ -152,3 +178,81 @@ def test_card_interest_cashback_and_dealer(tmp_db, fake_simplefin):
     assert cat("parts")[0] == "Mantenimiento auto"
     assert cat("mcd")[0] == "Comida fuera"
     assert cat("motel")[0] == "Hospedaje"
+
+
+def sync_more(fake, *txs):
+    fake.accounts[0]["transactions"] += list(txs)
+    server.sync_transactions()
+
+
+def test_history_names_a_cut_pending_charge(synced):
+    sync_more(
+        synced,
+        make_tx("market", 9, "-20.00", "PURCHASE AUTHORIZED ON 03/01 ZQX CORNER MARKET", "Zqx Corner Market"),
+        make_tx("pending", 0, "-5.00", "PURCHASE ZQX CORNER M CHULA VISTA CA CARD1111", "Zqx Corner M", pending=True),
+    )
+    assert cat("market") == ("Súper", "rule")
+    assert cat("pending") == ("Súper", "history")
+
+
+def test_manual_choice_teaches_history(synced):
+    server.set_category(["mystery"], "Compras")
+    sync_more(synced, make_tx("mystery-2", 0, "-9.00", "PURCHASE AUTHORIZED ON 03/09 ZQX SHOP", "Zqx Shop"))
+    assert cat("mystery-2") == ("Compras", "history")
+
+
+def test_history_skips_mixed_merchants_and_description_rules(synced):
+    server.set_category(["mystery"], "Compras")
+    sync_more(
+        synced,
+        make_tx("mystery-2", 1, "-9.00", "ZQX SHOP", "Zqx Shop"),
+        make_tx("mystery-3", 0, "-7.00", "ZQX SHOP", "Zqx Shop"),
+        # Matched by a description rule: says nothing about other "Nissan" charges.
+        make_tx("loan", 2, "-400.00", "NISSAN RET       Auto Loan  260908 0000000001      DOE JANE", "Nissan"),
+        make_tx("dealer", 0, "-27.64", "MOSSY NISSAN CHULA VIS", "Nissan"),
+    )
+    server.set_category(["mystery-2"], "Salud")  # now "Zqx Shop" has two categories
+    server.recategorize()
+    assert cat("mystery-3") == (None, "none")
+    assert cat("loan")[0] == "Préstamo auto"
+    assert cat("dealer") == (None, "none")
+
+
+def test_remember_creates_a_rule_for_the_merchant(synced):
+    result = server.set_category(["mystery"], "Compras", remember=True)
+    assert result["rules_created"] == [{"merchant": "Zqx Shop", "direction": "out"}]
+    assert result["set_manually"] == 0
+    assert cat("mystery") == ("Compras", "rule")
+
+    # A later pending charge from the same merchant is categorized by the rule, and the rule is replaced, not
+    # duplicated, when the merchant is remembered again.
+    sync_more(synced, make_tx("pending", 0, "-3.00", "ZQX SHOP", "Zqx Shop", pending=True))
+    assert cat("pending") == ("Compras", "rule")
+    server.set_category(["pending"], "Salud", remember=True)
+    assert cat("mystery") == ("Salud", "rule")
+    user_rules = [r for r in server.manage_rules(action="list") if r["source"] == "user"]
+    assert [(r["pattern"], r["category"], r["transactions"]) for r in user_rules] == [("Zqx Shop", "Salud", 2)]
+
+
+def test_review_uncategorized_groups_by_merchant(synced):
+    sync_more(synced, make_tx("mystery-in", 0, "12.00", "ZQX SHOP REFUND", "Zqx Shop"))
+    review = server.review_uncategorized()
+    groups = {(g["merchant"], g["direction"]): g for g in review["groups"]}
+    assert set(groups) == {("Zqx Shop", "out"), ("Zqx Shop", "in")}
+    out = groups[("Zqx Shop", "out")]
+    assert out["transaction_ids"] == ["mystery"] and out["total"] == -12.0
+    assert out["examples"][0]["description"].endswith("ZQX SHOP")
+    assert "Súper" in review["categories"]["expense"]
+
+
+def test_review_can_include_history_guesses(synced):
+    server.set_category(["mystery"], "Compras")
+    sync_more(synced, make_tx("mystery-2", 0, "-9.00", "ZQX SHOP", "Zqx Shop"))
+    assert server.review_uncategorized()["groups"] == []
+    (group,) = server.review_uncategorized(include_guessed=True)["groups"]
+    assert group["transaction_ids"] == ["mystery-2"] and group["guessed_category"] == "Compras"
+
+
+def test_sync_points_to_review_when_something_is_left(synced):
+    result = server.sync_transactions()
+    assert result["uncategorized"] == 1 and "review_uncategorized" in result["next_step"]

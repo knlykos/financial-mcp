@@ -1,53 +1,67 @@
 import json
-import sqlite3
+
+import pytest
 
 from personal_financial_mcp import db
 
-LEGACY_SCHEMA = """
-CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, institution TEXT, currency TEXT, balance REAL,
-                       available_balance REAL, balance_date TEXT, synced_at TEXT);
-CREATE TABLE transactions (account_id TEXT NOT NULL REFERENCES accounts(id), id TEXT NOT NULL, date TEXT NOT NULL,
-                           posted TEXT, amount REAL NOT NULL, description TEXT, payee TEXT, memo TEXT,
-                           pending INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (account_id, id));
-INSERT INTO accounts (id, name) VALUES ('ACC-A', 'Checking A');
-INSERT INTO transactions (account_id, id, date, amount, description, payee)
-VALUES ('ACC-A', 'T1', '2026-03-01', -12.5, 'PURCHASE AUTHORIZED ON 03/01 UBR* PENDING.UBER.COM CA', 'Uber Pending Transaction'),
-       ('ACC-A', 'T2', '2026-03-02', -8.0, 'PURCHASE AUTHORIZED ON 03/02 SHOP', 'Corner Shop San Diego Ca');
-"""
+from .conftest import make_account, make_tx
 
 
-def test_legacy_db_is_backed_up_migrated_and_backfilled(tmp_db):
-    legacy = sqlite3.connect(db.DB_PATH)
-    legacy.executescript(LEGACY_SCHEMA)
-    legacy.close()
-
+def store(accounts):
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == len(db.MIGRATIONS)
-        rows = dict(conn.execute("SELECT id, payee_normalized FROM transactions").fetchall())
-    assert rows == {"T1": "Uber", "T2": "Corner Shop"}
-
-    backups = list((tmp_db / "backups").glob("finance-*-v0.db"))
-    assert len(backups) == 1
-    old = sqlite3.connect(backups[0])
-    assert old.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 2
-    old.close()
+        db.upsert_accounts(conn, accounts)
+        db.upsert_transactions(conn, accounts)
 
 
-def test_migrations_are_idempotent_and_fresh_db_has_no_backup(tmp_db):
-    with db.connect():
-        pass
+def test_migrations_are_idempotent(tmp_db):
+    with db.connect() as conn:
+        assert db.schema_version(conn) == len(db.MIGRATIONS)
     db._initialized.clear()
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == len(db.MIGRATIONS)
-    assert not (tmp_db / "backups").exists()
+        assert db.schema_version(conn) == len(db.MIGRATIONS)
+        assert conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 1
+
+
+def test_failed_migration_rolls_back_everything(tmp_db, monkeypatch):
+    def broken(conn):
+        conn.execute("CREATE TABLE half_done (id int)")
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(db, "MIGRATIONS", [*db.MIGRATIONS, broken])
+    with pytest.raises(RuntimeError, match="boom"):
+        with db.connect():
+            pass
+
+    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS[:-1])
+    with db.connect() as conn:
+        assert db.schema_version(conn) == len(db.MIGRATIONS)
+        assert conn.execute("SELECT to_regclass('half_done')").fetchone()[0] is None
+
+
+def test_rows_read_by_name_position_and_as_dict(tmp_db):
+    with db.connect() as conn:
+        row = conn.execute("SELECT 1 AS one, 'x' AS two").fetchone()
+    assert (row["one"], row[1], dict(row), tuple(row)) == (1, "x", {"one": 1, "two": "x"}, (1, "x"))
+
+
+def test_dates_come_back_as_iso_text(tmp_db):
+    store([make_account("ACC-A", "Checking A", "10.00", [make_tx("T1", 3, "-5.00", "SHOP", "Shop")])])
+    with db.connect() as conn:
+        row = conn.execute("SELECT t.date, a.balance_date, a.synced_at FROM transactions t, accounts a").fetchone()
+    assert all(isinstance(v, str) for v in row)
+    assert len(row["date"]) == 10
 
 
 def test_local_aliases_override_seeds_and_renormalize(tmp_db):
-    legacy = sqlite3.connect(db.DB_PATH)
-    legacy.executescript(LEGACY_SCHEMA)
-    legacy.close()
-    with db.connect():
-        pass
+    store([
+        make_account("ACC-A", "Checking A", "10.00", [
+            make_tx("T1", 1, "-12.50", "PURCHASE AUTHORIZED ON 03/01 UBR* PENDING.UBER.COM CA", "Uber Pending Transaction"),
+            make_tx("T2", 2, "-8.00", "PURCHASE AUTHORIZED ON 03/02 SHOP", "Corner Shop San Diego Ca"),
+        ]),
+    ])
+    with db.connect() as conn:
+        rows = dict(conn.execute("SELECT id, payee_normalized FROM transactions").fetchall())
+    assert rows == {"T1": "Uber", "T2": "Corner Shop"}
 
     db.LOCAL_RULES_FILE.write_text(json.dumps({"payee_aliases": [{"pattern": "^Corner Shop", "normalized": "Corner Shop Co"}]}))
     db._initialized.clear()
@@ -61,8 +75,12 @@ def test_local_aliases_override_seeds_and_renormalize(tmp_db):
 def test_connections_are_closed(tmp_db):
     with db.connect() as conn:
         pass
-    try:
-        conn.execute("SELECT 1")
-    except sqlite3.ProgrammingError:
-        return
-    raise AssertionError("connection should be closed after the with block")
+    assert conn.closed
+
+
+def test_missing_database_url_is_a_clear_error(tmp_db, monkeypatch, tmp_path):
+    monkeypatch.delenv("DATABASE_URL")
+    monkeypatch.setattr(db, "DATABASE_URL_FILE", tmp_path / "missing")
+    with pytest.raises(Exception, match="No database configured"):
+        with db.connect():
+            pass

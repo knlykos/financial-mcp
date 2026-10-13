@@ -1,8 +1,13 @@
 import pytest
 
-from personal_financial_mcp.normalize import SEED_ALIASES, clean_description, compile_aliases, normalize_payee
+from personal_financial_mcp.categories import same_merchant
+from personal_financial_mcp.normalize import (
+    SEED_ALIASES, SEED_DESCRIPTION_ALIASES, clean_description, compile_aliases, normalize_payee,
+)
 
-ALIASES = compile_aliases([(p, n, "payee") for p, n in SEED_ALIASES])
+ALIASES = compile_aliases(
+    [(p, n, "description") for p, n in SEED_DESCRIPTION_ALIASES] + [(p, n, "payee") for p, n in SEED_ALIASES]
+)
 
 # (payee from SimpleFIN or None, raw bank description, expected payee_normalized). Anonymized, made-up refs.
 CASES = [
@@ -19,6 +24,14 @@ CASES = [
     ("Carnival Supermarket National City Ca", "PURCHASE AUTHORIZED ON 03/09 CARNIVAL SUPERMARK NATIONAL CITY CA S100000000000009 CARD 1111", "Carnival Supermarket"),
     ("Blue Owl Cafe San Diego Ca", "PURCHASE AUTHORIZED ON 03/10 TST*BLUE OWL CAFE San Diego CA S100000000000010 CARD 1111", "Blue Owl Cafe"),
     (None, "PURCHASE AUTHORIZED ON 03/01 BLUE OWL CAFE SAN DIEGO CA S100000000000011 CARD 1111", "Blue Owl Cafe"),
+    ("Aldi", "PURCHASE AUTHORIZED ON 03/04 ALDI INC CHULA VISTA CA S100000000000012 CARD 1111", "Aldi"),
+    # Pending charges: the merchant name is cut to ~12 characters.
+    ("Carnival Sup Chula", "PURCHASE CARNIVAL SUP Chula Vista   CA CARD1111", "Carnival Supermarket"),
+    ("Microsoft Re", "PURCHASE MICROSOFT*RE +18005550102  WA CARD1111", "Microsoft"),
+    ("Transfer Uber Money", "TRANSFER Uber         Money Transf  CA CARD1111", "Uber Payout"),
+    # Zelle: SimpleFIN names the payee after a brand in the sender's note.
+    ("Minecraft", "ZELLE TO  DOE J ON 03/01 REF # WFCT00000001 MINECRAFT REALM", "Zelle Transfer"),
+    ("Transfer to Apple Pay", "ZELLE TO  DOE J ON 03/01 REF # WFCT00000002 APPLE CASH", "Zelle Transfer"),
 ]
 
 
@@ -28,7 +41,7 @@ def test_normalize_payee(payee, description, expected):
 
 
 def test_clean_description_strips_prefix_refs_and_spaces():
-    raw = "PURCHASE   AUTHORIZED ON   03/02 SOME SHOP 619-555-0123 CA S346250825464456 CARD 0310"
+    raw = "PURCHASE   AUTHORIZED ON   03/02 SOME SHOP 619-555-0123 CA S100000000000013 CARD 1111"
     assert clean_description(raw) == "Some Shop Ca"
 
 
@@ -52,3 +65,15 @@ def test_description_field_alias_matches_generic_payee():
 
 def test_empty_inputs():
     assert normalize_payee(None, None, ALIASES) == ""
+
+
+@pytest.mark.parametrize("a,b,same", [
+    ("sunrise mark", "sunrise market", True),  # pending cut mid-word
+    ("carnival sup chula", "carnival supermarket", True),  # same first 12 characters
+    ("microsoft re", "microsoft", True),  # whole word prefix
+    ("zqx", "zqx shop", False),  # too short to trust
+    ("costco", "costco gas", True),
+    ("sunrise brewi", "sunrise market", False),
+])
+def test_same_merchant(a, b, same):
+    assert same_merchant(a, b) is same

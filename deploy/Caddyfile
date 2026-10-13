@@ -1,0 +1,11 @@
+# HTTPS (automatic Let's Encrypt) in front of the MCP server. The domain comes from .env.
+{$FINANZAS_DOMAIN} {
+	reverse_proxy finanzas:8000 {
+		flush_interval -1  # stream MCP responses (SSE) without buffering
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+}

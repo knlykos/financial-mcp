@@ -7,8 +7,10 @@ from dataclasses import dataclass
 # Patterns are case-insensitive regexes; first match wins. They are tested against the payee when SimpleFIN
 # provides one, and against the raw description only when it doesn't (or when an alias has field="description"):
 # descriptions can quote other transactions, e.g. an overdraft fee naming the charge that caused it.
+# Pending card charges arrive cut to ~12 characters ("PURCHASE CARNIVAL SUP Chula Vista CA"), so aliases also
+# cover the cut name; otherwise a charge only gets its category once it posts.
 SEED_ALIASES: list[tuple[str, str]] = [
-    (r"^Uber Payout$|Money Transfer\s*(Authorized On \d\d/\d\d)?\s*From Uber", "Uber Payout"),
+    (r"^Uber Payout$|Money Transfer\s*(Authorized On \d\d/\d\d)?\s*From Uber|^Transfer Uber Money\b", "Uber Payout"),
     (r"^Uber( Amsterdam| Pending Transaction)?$|\bUBR\*|\bUBER\s*\*\s*(TRIP|EATS)", "Uber"),
     (r"^Apple$|APPLE\.COM/BILL", "Apple"),
     (r"^Costco Gas$|COSTCO GAS", "Costco Gas"),
@@ -16,7 +18,9 @@ SEED_ALIASES: list[tuple[str, str]] = [
     (r"^Capital One Auto Loan$|CAPITAL ONE AUTO", "Capital One Auto Loan"),
     (r"^Capital One( Credit Card( Payment)?)?$|CAPITAL ONE\s*(CRCARDPMT|MOBILE PMT|ONLINE PMT)", "Capital One Credit Card"),
     (r"^Apple Credit Card$|\bAPPLECARD\b", "Apple Credit Card"),
-    (r"CARNIVAL SUPERMARK", "Carnival Supermarket"),
+    (r"\bCARNIVAL SUP", "Carnival Supermarket"),
+    (r"^Microsoft\b|\bMICROSOFT\s*\*", "Microsoft"),
+    (r"\bALDI\b", "Aldi"),
     (r"OTAY FARMS", "Otay Farms Market"),
     (r"STARS GAS", "Stars Gas"),
     (r"LUV CAR WAS", "Luv Car Wash"),
@@ -26,6 +30,12 @@ SEED_ALIASES: list[tuple[str, str]] = [
     (r"\bCALIMAX\b", "Calimax"),
     (r"\bAUTOZONE", "AutoZone"),  # "PAYPAL *AUTOZONEINC"
     (r"^San Diego Gas & Electric$|SD GAS & ELEC", "San Diego Gas & Electric"),
+]
+
+# Checked against the raw description, before SEED_ALIASES. For Zelle, SimpleFIN builds the payee from the
+# sender's note, so "ZELLE TO ... MINECRAFT REALM" would otherwise become the merchant "Minecraft".
+SEED_DESCRIPTION_ALIASES: list[tuple[str, str]] = [
+    (r"^ZELLE (TO|FROM)\b", "Zelle Transfer"),
 ]
 
 # Trailing "<city> Ca|Mex" that SimpleFIN appends to some payees. Public place names, not personal data.

@@ -2,9 +2,10 @@
 
 import hashlib
 import re
-import sqlite3
 from dataclasses import dataclass
 from datetime import date
+
+from .pg import Connection, executemany
 
 MAX_DAYS_APART = 2
 # Card payments can take a few business days to show on the card (e.g. Apple Card posts before Wells Fargo).
@@ -28,7 +29,7 @@ class _Tx:
     to_card: bool  # lands on a credit card account
 
 
-def own_last4(conn: sqlite3.Connection) -> set[str]:
+def own_last4(conn: Connection) -> set[str]:
     """Last-4 digits of the user's accounts, taken from account names like 'CHECKING ...1234 (1234)'."""
     return {m for (name,) in conn.execute("SELECT name FROM accounts") for m in _LAST4.findall(name or "")}
 
@@ -66,7 +67,7 @@ def _pair_id(out: _Tx, inc: _Tx) -> str:
     return "tp-" + hashlib.sha1(f"{out.account_id}/{out.id}|{inc.account_id}/{inc.id}".encode()).hexdigest()[:12]
 
 
-def match_internal_transfers(conn: sqlite3.Connection) -> int:
+def match_internal_transfers(conn: Connection) -> int:
     """Recompute is_internal_transfer / transfer_pair_id for all transactions. Returns the number of pairs.
 
     A pair is money out of one own account and the same amount into a different own account within
@@ -111,9 +112,13 @@ def match_internal_transfers(conn: sqlite3.Connection) -> int:
         pair = _pair_id(out, inc)
         updates += [(pair, *out_key), (pair, *inc_key)]
 
-    conn.execute("UPDATE transactions SET is_internal_transfer = 0, transfer_pair_id = NULL")
-    conn.executemany(
-        "UPDATE transactions SET is_internal_transfer = 1, transfer_pair_id = ? WHERE account_id = ? AND id = ?",
+    conn.execute(
+        "UPDATE transactions SET is_internal_transfer = false, transfer_pair_id = NULL "
+        "WHERE is_internal_transfer OR transfer_pair_id IS NOT NULL"
+    )
+    executemany(
+        conn,
+        "UPDATE transactions SET is_internal_transfer = true, transfer_pair_id = %s WHERE account_id = %s AND id = %s",
         updates,
     )
     return len(updates) // 2

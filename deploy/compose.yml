@@ -1,0 +1,36 @@
+# Lives next to .env and local_rules.json on the server (neither in git). See deploy/README.md.
+# .env must set FINANZAS_DOMAIN (e.g. finanzas.example.dev) plus the secrets listed in the README.
+services:
+  finanzas:
+    build: .
+    image: finanzas-mcp
+    container_name: finanzas-mcp
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      FINANZAS_PUBLIC_URL: https://${FINANZAS_DOMAIN:?set FINANZAS_DOMAIN in .env}
+    volumes:
+      - ./local_rules.json:/app/local_rules.json:ro
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 512m
+    # No published ports: only Caddy reaches it.
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: finanzas-caddy
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      FINANZAS_DOMAIN: ${FINANZAS_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [finanzas]
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,11 +1,21 @@
-"""Shared fixtures. All data here is synthetic: no real bank data in tests."""
+"""Shared fixtures. All data here is synthetic: no real bank data in tests.
 
+Tests need a throwaway Postgres (e.g. a Neon "test" branch): TEST_DATABASE_URL, else .test-database-url.
+Each test gets its own schema, dropped afterwards.
+"""
+
+import os
 import time
+import uuid
 from typing import Any
 
+import psycopg
 import pytest
 
 from personal_financial_mcp import db, server
+from personal_financial_mcp.simplefin import PROJECT_ROOT
+
+TEST_DATABASE_URL_FILE = PROJECT_ROOT / ".test-database-url"
 
 NOW = int(time.time())
 DAY = 86_400
@@ -31,13 +41,29 @@ def make_account(acc_id: str, name: str, balance: str, transactions: list[dict[s
     }
 
 
+@pytest.fixture(scope="session")
+def test_database_url() -> str:
+    url = os.environ.get("TEST_DATABASE_URL", "").strip()
+    if not url and TEST_DATABASE_URL_FILE.exists():
+        url = TEST_DATABASE_URL_FILE.read_text().strip()
+    if not url:
+        pytest.fail(f"Set TEST_DATABASE_URL or put a throwaway Postgres URL in {TEST_DATABASE_URL_FILE}")
+    return url
+
+
 @pytest.fixture
-def tmp_db(tmp_path, monkeypatch):
-    """Point the app at an empty temporary database and no local rules file."""
-    monkeypatch.setattr(db, "DB_PATH", tmp_path / "finance.db")
+def tmp_db(tmp_path, monkeypatch, test_database_url):
+    """Point the app at an empty schema of the test database and no local rules file."""
+    schema = f"test_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(test_database_url, autocommit=True) as conn:
+        conn.execute(f"CREATE SCHEMA {schema}")
+    sep = "&" if "?" in test_database_url else "?"
+    monkeypatch.setenv("DATABASE_URL", f"{test_database_url}{sep}options=-csearch_path%3D{schema}")
     monkeypatch.setattr(db, "LOCAL_RULES_FILE", tmp_path / "local_rules.json")
     monkeypatch.setattr(db, "_initialized", set())
-    return tmp_path
+    yield tmp_path
+    with psycopg.connect(test_database_url, autocommit=True) as conn:
+        conn.execute(f"DROP SCHEMA {schema} CASCADE")
 
 
 @pytest.fixture

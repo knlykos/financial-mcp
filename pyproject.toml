@@ -10,11 +10,14 @@ requires-python = ">=3.13"
 dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=2.3.0",
+    "psycopg[binary]>=3.2",
 ]
 
 [project.scripts]
 personal-financial-mcp = "personal_financial_mcp:main"
 pfm-setup = "personal_financial_mcp.setup:main"
+pfm-auth = "personal_financial_mcp.auth:cli"
+pfm-sync = "personal_financial_mcp.server:sync_main"
 
 [build-system]
 requires = ["hatchling"]

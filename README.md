@@ -1,6 +1,6 @@
 # personal-financial-mcp
 
-Servidor MCP que lee tus cuentas bancarias (Wells Fargo, etc.) a través de [SimpleFIN Bridge](https://beta-bridge.simplefin.org/) y guarda las transacciones en una base SQLite local para analizarlas. Solo lectura.
+Servidor MCP que lee tus cuentas bancarias (Wells Fargo, etc.) a través de [SimpleFIN Bridge](https://beta-bridge.simplefin.org/) y guarda las transacciones en Postgres ([Neon](https://neon.tech)) para analizarlas. Solo lectura.
 
 ## Setup
 
@@ -10,6 +10,8 @@ uv run pfm-setup <tu-setup-token-de-simplefin>
 ```
 
 El setup token es de un solo uso: `pfm-setup` lo canjea por un *access URL* permanente y lo guarda en `.simplefin-access-url`. Si ya tienes el access URL (`https://usuario:clave@...`), pásalo en lugar del token o ponlo en la variable `SIMPLEFIN_ACCESS_URL`.
+
+La base de datos es Postgres: pon la cadena de conexión en `.database-url` o en la variable `DATABASE_URL`. Con Neon, usa el endpoint directo (sin `-pooler`). Las tablas se crean solas en el primer arranque.
 
 ## Registrar en Claude Code
 
@@ -22,12 +24,13 @@ claude mcp add finanzas -- uv run --directory C:/Users/nefil/Documents/dev/perso
 | Herramienta | Qué hace |
 |---|---|
 | `list_accounts` | Cuentas con saldo actual y disponible (`refresh=true` para pedirlos al banco). |
-| `sync_transactions` | Descarga hasta 90 días de transacciones a la base local. |
-| `get_transactions` | Consulta la base local por fechas, cuenta o texto. Parámetros opcionales `fields`, `compact`, `exclude_internal` y `category`. |
+| `sync_transactions` | Descarga hasta 90 días de transacciones a la base. |
+| `get_transactions` | Consulta la base por fechas, cuenta o texto. Parámetros opcionales `fields`, `compact`, `exclude_internal` y `category`. |
 | `list_categories` | Categorías con su tipo (income, expense, transfer, debt), número de transacciones y total. |
-| `set_category` | Asigna una categoría a mano (gana sobre las reglas); `null` la quita y vuelve a aplicar reglas. |
+| `set_category` | Asigna una categoría a mano (gana sobre las reglas); `null` la quita y vuelve a aplicar reglas. Con `remember=true` además crea la regla para ese comercio. |
+| `review_uncategorized` | Lo que falta por categorizar, agrupado por comercio, con descripciones del banco e ids, para que Claude lo categorice. |
 | `manage_rules` | Lista, agrega, borra o prueba (`test`, sin guardar) reglas de categorización. |
-| `recategorize` | Vuelve a aplicar las reglas sin tocar las categorías manuales. |
+| `recategorize` | Vuelve a aplicar las reglas y el historial sin tocar las categorías manuales. |
 
 Cada transacción incluye `payee_normalized`: el nombre del comercio limpio (sin ciudad, prefijos ni referencias) y unificado con alias, ideal para agrupar. Ejemplos:
 
@@ -53,7 +56,11 @@ get_transactions({"start_date": "2026-08-01", "end_date": "2026-08-31", "exclude
 
 ### Categorías y reglas
 
-Cada transacción tiene `category` y `category_source` (`manual`, `rule` o `none`). El orden es: categoría manual → transferencia interna → reglas (el número de `priority` más bajo primero: usuario 10, `local_rules.json` 50, genéricas 100).
+Cada transacción tiene `category` y `category_source` (`manual`, `rule`, `history` o `none`). El orden es: categoría manual → transferencia interna → reglas (el número de `priority` más bajo primero: usuario 10, `local_rules.json` 50, genéricas 100) → historial.
+
+**Historial.** Si ninguna regla aplica, se usa la categoría que ese comercio ya tenía (a mano o por una regla sobre el nombre), en la misma dirección. También reconoce los nombres cortados de los cargos pendientes ("Sunrise Mark" → "Sunrise Market"). Un comercio con más de una categoría no se adivina.
+
+**Claude categoriza.** Lo que queda sin categoría lo resuelve Claude: `sync_transactions` avisa cuántos faltan, `review_uncategorized` los agrupa por comercio con la descripción cruda, y `set_category(..., remember=true)` los categoriza y crea la regla para que el comercio sea automático desde entonces. Los cargos pendientes se reemplazan al cobrarse, así que una categoría puesta a mano en un pendiente sin `remember` se pierde.
 
 Tipos de regla: `exact` (el campo completo), `contains` (palabras o frase completas: "Fee" no coincide con "Coffee") y `regex`. `direction` limita a entradas (`in`), salidas (`out`) o ambas.
 
@@ -64,13 +71,15 @@ manage_rules({"action": "test", "pattern": "Del Sol", "match_type": "contains"})
 manage_rules({"action": "add", "pattern": "Del Sol", "match_type": "contains", "category": "Comida fuera"})
 // Corregir una transacción a mano
 set_category({"transaction_ids": ["TRN-123"], "category": "Compras"})
-// Lo que falta por categorizar
-get_transactions({"category": "(sin categoría)", "compact": true})
+// Lo que falta por categorizar, agrupado por comercio
+review_uncategorized({})
+// Categorizar un comercio y recordarlo
+set_category({"transaction_ids": ["TRN-123", "TRN-456"], "category": "Súper", "remember": true})
 ```
 
 Las reglas genéricas (`categories.py`) no se pueden borrar desde la herramienta; se anulan con una regla de usuario de menor `priority`.
 
-SimpleFIN solo da ~90 días de historial por consulta, actualiza los datos ~1 vez al día y limita las consultas diarias. Por eso todo se guarda en `data/finance.db`: sincronizando regularmente, el historial crece más allá de esos 90 días.
+SimpleFIN solo da ~90 días de historial por consulta, actualiza los datos ~1 vez al día y limita las consultas diarias. Por eso todo se guarda en la base: sincronizando regularmente, el historial crece más allá de esos 90 días.
 
 ## Alias, categorías y reglas personales (`local_rules.json`)
 
@@ -96,17 +105,19 @@ En `category_rules`, `match_field` (por defecto `payee_normalized`), `match_type
 
 ## Base de datos y pruebas
 
-- El esquema se migra solo al arrancar (`PRAGMA user_version`); antes de migrar se guarda una copia en `data/backups/`.
-- Pruebas (solo datos inventados): `uv run pytest`
+- El esquema se migra solo al arrancar (tabla `schema_version`). Cada migración corre en una transacción con un lock, así que si falla no deja nada a medias, y dos servidores arrancando a la vez no chocan. Neon además guarda historial para restaurar a un punto en el tiempo.
+- Pruebas (solo datos inventados): `uv run pytest`. Necesitan un Postgres desechable en `.test-database-url` o `TEST_DATABASE_URL` (por ejemplo una rama `test` de Neon). Cada prueba crea su propio esquema y lo borra al terminar.
+- `scripts/import_sqlite.py` copió la base SQLite anterior (`data/finance.db`) a Postgres. Solo se usa una vez y no corre si la base destino ya tiene transacciones.
 
 ## Estructura
 
 - `src/personal_financial_mcp/simplefin.py`: cliente del protocolo SimpleFIN.
-- `src/personal_financial_mcp/db.py`: esquema, migraciones y consultas SQLite.
+- `src/personal_financial_mcp/db.py`: esquema, migraciones y consultas.
+- `src/personal_financial_mcp/pg.py`: conexión a Postgres y filas accesibles por nombre o posición.
 - `src/personal_financial_mcp/normalize.py`: limpieza de nombres de comercio y alias.
 - `src/personal_financial_mcp/transfers.py`: emparejamiento de transferencias internas.
 - `src/personal_financial_mcp/categories.py`: categorías, reglas genéricas y motor de categorización.
 - `src/personal_financial_mcp/server.py`: herramientas MCP. Las nuevas funciones de análisis van aquí.
 - `src/personal_financial_mcp/setup.py`: canje del setup token.
 
-`.simplefin-access-url`, `local_rules.json` y `data/` están en `.gitignore`: contienen tus credenciales y tus datos financieros.
+`.simplefin-access-url`, `.database-url`, `.test-database-url`, `local_rules.json` y `data/` están en `.gitignore`: contienen tus credenciales y tus datos financieros.

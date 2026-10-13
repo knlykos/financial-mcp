@@ -6,6 +6,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from personal_financial_mcp import server
 
+from .conftest import make_account, make_tx
+
 ORIGINAL_FIELDS = {"date", "amount", "description", "payee", "memo", "pending", "account", "account_id", "id"}
 
 
@@ -63,3 +65,50 @@ def test_reads_do_not_call_simplefin(tmp_db, fake_simplefin, sample_accounts):
     server.get_transactions(compact=True)
     server.list_accounts()
     assert len(fake_simplefin.calls) == calls_before
+
+
+def checking(balance, available, pending_amounts):
+    acc = make_account("ACC-W", "EVERYDAY CHECKING ...0001 (0001)", balance, [])
+    acc["available-balance"] = available
+    acc["transactions"] = [
+        make_tx(f"P{i}", 0, amount, "PURCHASE AUTHORIZED ON 10/06 SOME STORE", pending=True)
+        for i, amount in enumerate(pending_amounts)
+    ]
+    return acc
+
+
+def balances():
+    (acc,) = server.list_accounts()
+    return acc["balance"], acc["available_balance"]
+
+
+@pytest.mark.parametrize(
+    "reported, pending, expected",
+    [
+        (("662.25", "19.72"), ["-500.00", "-181.97"], (662.25, -19.72)),  # available dropped its minus
+        (("64.32", "1911.95"), ["1976.27"], (-64.32, 1911.95)),  # overdrawn, payroll pending
+        (("64.32", "64.32"), [], (64.32, 64.32)),  # no pending: nothing to tell signs apart
+        (("100.00", "40.00"), ["-60.00"], (100.0, 40.0)),  # already consistent
+        (("100.00", "35.00"), ["-60.00"], (100.0, 35.0)),  # unexplained hold: leave as reported
+    ],
+)
+def test_sync_restores_dropped_minus_on_checking(tmp_db, fake_simplefin, reported, pending, expected):
+    fake_simplefin.accounts = [checking(*reported, pending)]
+    server.sync_transactions()
+    assert balances() == expected
+
+
+def test_credit_card_balance_kept_and_zero_available_is_unknown(tmp_db, fake_simplefin):
+    card = make_account("ACC-C", "Quicksilver (0002)", "-500.00", [])
+    card["available-balance"] = "0.00"  # Capital One sends 0 when it doesn't share available credit
+    fake_simplefin.accounts = [card]
+    server.sync_transactions()
+    assert balances() == (-500.0, None)
+
+
+def test_credit_card_real_available_credit_is_kept(tmp_db, fake_simplefin):
+    card = make_account("ACC-C", "Quicksilver (0002)", "-500.00", [])
+    card["available-balance"] = "1500.00"
+    fake_simplefin.accounts = [card]
+    server.sync_transactions()
+    assert balances() == (-500.0, 1500.0)

@@ -5,12 +5,13 @@ Generic seed categories/rules live here; personal ones (people's names, local sh
 """
 
 import re
-import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
 from mcp.server.mcpserver.exceptions import ToolError
+
+from .pg import Connection, Row, executemany
 
 KINDS = ("income", "expense", "transfer", "debt")
 MATCH_FIELDS = ("payee_normalized", "payee", "description", "memo")
@@ -89,7 +90,7 @@ SEED_RULES: list[tuple[str, str, str, str, str]] = [
     *_exact(
         "Súper", "Costco", "Walmart", "Carnival Supermarket", "Northgate Gonzalez Market", "Target", "El Super",
         "Vons", "Trader Joe's", "Smart & Final", "Grocery Outlet", "Pavillions", "Calimax", "Otay Farms Market",
-        "Whole Foods",
+        "Whole Foods", "Aldi",
     ),
     *_words("Súper", "Supermarket", "Grocery", "Market"),
     *_exact(
@@ -113,6 +114,9 @@ SEED_RULES: list[tuple[str, str, str, str, str]] = [
         "Compras", "Amazon", "Shein", "Ikea", "The Home Depot", "Burlington", "Michaels", "MINISO", "UPS", "Steam",
         "Humble Bundle", "TJ Maxx", "Five Below", "Harbor Freight Tools", "Guitar Center", "iFixit",
     ),
+    # PayPal checkouts SimpleFIN couldn't name ("PAYPAL PURCHASE 260301 SOMESHOPXYZ ..."). Last, so a known
+    # merchant behind PayPal (Steam, AutoZone) keeps its own category.
+    ("description", "regex", r"^PAYPAL\s+PURCHASE\b", "Compras", "out"),
 ]
 
 
@@ -124,7 +128,7 @@ class Rule:
     direction: str
     category_id: int
 
-    def matches(self, tx: sqlite3.Row) -> bool:
+    def matches(self, tx: Row) -> bool:
         if self.direction == "in" and tx["amount"] <= 0 or self.direction == "out" and tx["amount"] >= 0:
             return False
         return bool(self.regex.search(tx[self.field] or ""))
@@ -156,16 +160,17 @@ def _validate_rule(match_field: str, match_type: str, pattern: str, direction: s
 # --- Seeding --------------------------------------------------------------------------------------
 
 
-def sync_seed_rules(conn: sqlite3.Connection, local: dict[str, Any]) -> bool:
+def sync_seed_rules(conn: Connection, local: dict[str, Any]) -> bool:
     """Make seed/local categories and rules in the DB match the code and local_rules.json. Returns True if changed."""
     categories = [(n, k, "seed") for n, k in SEED_CATEGORIES]
     categories += [(c["name"], c.get("kind", "expense"), "local") for c in local.get("categories", [])]
     for name, kind, _ in categories:
         if kind not in KINDS:
             raise ValueError(f"Category {name!r} has invalid kind {kind!r}")
-    conn.executemany(
-        "INSERT INTO categories (name, kind, source) VALUES (?, ?, ?) "
-        "ON CONFLICT(name) DO UPDATE SET kind = excluded.kind",
+    executemany(
+        conn,
+        "INSERT INTO categories (name, kind, source) VALUES (%s, %s, %s) "
+        "ON CONFLICT (name) DO UPDATE SET kind = excluded.kind WHERE categories.kind <> excluded.kind",
         categories,
     )
 
@@ -199,10 +204,11 @@ def sync_seed_rules(conn: sqlite3.Connection, local: dict[str, Any]) -> bool:
         return False
     now = datetime.now().isoformat(timespec="seconds")
     conn.execute("DELETE FROM category_rules WHERE source IN ('seed', 'local')")
-    conn.executemany(
+    executemany(
+        conn,
         "INSERT INTO category_rules (match_field, match_type, pattern, category_id, direction, priority, source, "
-        f"created_at) VALUES (?, ?, ?, ?, ?, ?, ?, '{now}')",
-        rows,
+        "created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        [(*r, now) for r in rows],
     )
     return True
 
@@ -210,11 +216,11 @@ def sync_seed_rules(conn: sqlite3.Connection, local: dict[str, Any]) -> bool:
 # --- Lookups ---------------------------------------------------------------------------------------
 
 
-def category_ids(conn: sqlite3.Connection) -> dict[str, int]:
+def category_ids(conn: Connection) -> dict[str, int]:
     return {r["name"].lower(): r["id"] for r in conn.execute("SELECT id, name FROM categories")}
 
 
-def resolve_category(conn: sqlite3.Connection, category: str | int) -> int:
+def resolve_category(conn: Connection, category: str | int) -> int:
     ids = category_ids(conn)
     if isinstance(category, int) or str(category).isdigit():
         if int(category) in ids.values():
@@ -225,7 +231,7 @@ def resolve_category(conn: sqlite3.Connection, category: str | int) -> int:
     raise ToolError(f"Unknown category {category!r}. Valid categories: {names}")
 
 
-def load_rules(conn: sqlite3.Connection) -> list[Rule]:
+def load_rules(conn: Connection) -> list[Rule]:
     rows = conn.execute("SELECT * FROM category_rules ORDER BY priority, id").fetchall()
     return [Rule(r["id"], r["match_field"], compile_pattern(r["match_type"], r["pattern"]), r["direction"],
                  r["category_id"]) for r in rows]
@@ -234,97 +240,219 @@ def load_rules(conn: sqlite3.Connection) -> list[Rule]:
 # --- Applying rules --------------------------------------------------------------------------------
 
 
-def categorize(tx: sqlite3.Row, rules: list[Rule], internal_id: int) -> tuple[int | None, str]:
+def categorize(tx: Row, rules: list[Rule], internal_id: int) -> tuple[int | None, str, int | None]:
+    """(category_id, category_source, id of the rule that matched)."""
     if tx["is_internal_transfer"]:
-        return internal_id, "rule"
+        return internal_id, "rule", None
     for rule in rules:
         if rule.matches(tx):
-            return rule.category_id, "rule"
-    return None, "none"
+            return rule.category_id, "rule", rule.id
+    return None, "none", None
 
 
-def recategorize(conn: sqlite3.Connection, since: date | None = None) -> dict[str, int]:
-    """Re-apply rules to every non-manual transaction (on or after `since`)."""
+_UPDATE_CATEGORY = (
+    "UPDATE transactions SET category_id = %s, category_source = %s, category_rule_id = %s "
+    "WHERE account_id = %s AND id = %s"
+)
+
+
+# Pending card charges cut the merchant name to ~12 characters ("Sunrise Mark" for "Sunrise Market").
+TRUNCATED_LEN = 12
+
+
+def same_merchant(a: str, b: str) -> bool:
+    """Lowercased names: equal, or one is the other cut short (pending charges, "Microsoft" vs "Microsoft Re")."""
+    if a == b:
+        return True
+    short, long = sorted((a, b), key=len)
+    if long.startswith(short) and (len(short) >= 10 or len(short) >= 4 and long[len(short)] == " "):
+        return True
+    return len(short) >= TRUNCATED_LEN and short[:TRUNCATED_LEN] == long[:TRUNCATED_LEN]
+
+
+class History:
+    """What past transactions say about each merchant, per direction (money in vs out).
+
+    Learns from manual choices and from rules that matched the merchant name (not the description: "NISSAN RET
+    Auto Loan" says nothing about other "Nissan" charges). A merchant seen with more than one category is
+    ambiguous and never guessed.
+    """
+
+    def __init__(self, seen: list[tuple[str, float, int]]):  # (payee_normalized, amount, category_id)
+        self._cats: dict[tuple[bool, str], set[int]] = {}
+        for name, amount, cat in seen:
+            if key := name.strip().lower():
+                self._cats.setdefault((amount < 0, key), set()).add(cat)
+
+    def guess(self, name: str, amount: float) -> int | None:
+        key, out = name.strip().lower(), amount < 0
+        if not key:
+            return None
+        found: set[int] = set()
+        for (known_out, known), cats in self._cats.items():
+            if known_out == out and same_merchant(key, known):
+                found |= cats
+        return found.pop() if len(found) == 1 else None
+
+
+def recategorize(conn: Connection, since: date | None = None) -> dict[str, int]:
+    """Re-apply rules, then history, to every non-manual transaction (on or after `since`)."""
     rules = load_rules(conn)
+    by_name = {r.id for r in rules if r.field in ("payee_normalized", "payee")}
     internal_id = resolve_category(conn, INTERNAL_TRANSFER)
-    sql = "SELECT * FROM transactions WHERE category_source <> 'manual'"
-    params: list[Any] = []
-    if since:
-        sql += " AND date >= ?"
-        params.append(since.isoformat())
-    updates = []
-    changed = 0
-    for tx in conn.execute(sql, params).fetchall():
-        cat, source = categorize(tx, rules, internal_id)
-        changed += (cat, source) != (tx["category_id"], tx["category_source"])
-        updates.append((cat, source, tx["account_id"], tx["id"]))
-    conn.executemany(
-        "UPDATE transactions SET category_id = ?, category_source = ? WHERE account_id = ? AND id = ?", updates
+    txs = conn.execute("SELECT * FROM transactions").fetchall()
+    auto = [tx for tx in txs if tx["category_source"] != "manual"]
+    results = {(tx["account_id"], tx["id"]): categorize(tx, rules, internal_id) for tx in auto}
+
+    history = History(
+        [(tx["payee_normalized"], tx["amount"], tx["category_id"])
+         for tx in txs if tx["category_source"] == "manual" and not tx["is_internal_transfer"]]
+        + [(tx["payee_normalized"], tx["amount"], cat)
+           for tx in auto for cat, _, rule_id in [results[(tx["account_id"], tx["id"])]] if rule_id in by_name]
     )
-    uncategorized = sum(1 for u in updates if u[0] is None)
-    return {"evaluated": len(updates), "changed": changed, "uncategorized": uncategorized}
+    for tx in auto:
+        key = (tx["account_id"], tx["id"])
+        if results[key][0] is None and (guess := history.guess(tx["payee_normalized"], tx["amount"])):
+            results[key] = (guess, "history", None)
+
+    in_scope = [tx for tx in auto if since is None or str(tx["date"]) >= since.isoformat()]
+    new = [(tx, results[(tx["account_id"], tx["id"])]) for tx in in_scope]
+    updates = [
+        (*cat, tx["account_id"], tx["id"])
+        for tx, cat in new
+        if cat != (tx["category_id"], tx["category_source"], tx["category_rule_id"])
+    ]
+    executemany(conn, _UPDATE_CATEGORY, updates)
+    return {
+        "evaluated": len(in_scope),
+        "changed": len(updates),
+        "uncategorized": sum(1 for _, (cat, _, _) in new if cat is None),
+        "guessed_from_history": sum(1 for _, (_, source, _) in new if source == "history"),
+    }
 
 
 # --- Operations behind the MCP tools ---------------------------------------------------------------
 
 
-def list_categories(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def list_categories(conn: Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT c.id, c.name, c.kind, c.parent, COUNT(t.id) AS transactions, ROUND(COALESCE(SUM(t.amount), 0), 2) AS total
+        SELECT c.id, c.name, c.kind, c.parent, COUNT(t.id) AS transactions,
+               ROUND(COALESCE(SUM(t.amount), 0)::numeric, 2)::float8 AS total
         FROM categories c LEFT JOIN transactions t ON t.category_id = c.id
         GROUP BY c.id ORDER BY c.kind, c.name
         """
     ).fetchall()
     result = [dict(r) for r in rows]
     none = conn.execute(
-        "SELECT COUNT(*), ROUND(COALESCE(SUM(amount), 0), 2) FROM transactions WHERE category_id IS NULL"
+        "SELECT COUNT(*), ROUND(COALESCE(SUM(amount), 0)::numeric, 2)::float8 FROM transactions WHERE category_id IS NULL"
     ).fetchone()
     result.append({"id": None, "name": "(sin categoría)", "kind": None, "parent": None,
                    "transactions": none[0], "total": none[1]})
     return result
 
 
-def set_category(conn: sqlite3.Connection, transaction_ids: list[str], category: str | None) -> dict[str, Any]:
-    """Manually set a category (wins over rules). category=None clears the manual choice and re-applies rules."""
-    placeholders = ",".join("?" * len(transaction_ids))
-    found = {r["id"] for r in conn.execute(f"SELECT id FROM transactions WHERE id IN ({placeholders})", transaction_ids)}
+def set_category(
+    conn: Connection, transaction_ids: list[str], category: str | None, remember: bool = False
+) -> dict[str, Any]:
+    """Set a category by hand (wins over rules). category=None clears the manual choice and re-applies rules.
+
+    remember=True also adds a user rule per merchant (exact payee_normalized and direction), so future charges,
+    including the pending ones that are replaced when they post, get the category without a manual choice.
+    """
+    txs = conn.execute("SELECT * FROM transactions WHERE id = ANY(%s)", (transaction_ids,)).fetchall()
+    found = {tx["id"] for tx in txs}
     if missing := [t for t in transaction_ids if t not in found]:
         raise ToolError(f"Unknown transaction ids: {missing}")
     if category is None:
-        conn.execute(
-            f"UPDATE transactions SET category_source = 'none' WHERE id IN ({placeholders})", transaction_ids
-        )
-        rules, internal_id = load_rules(conn), resolve_category(conn, INTERNAL_TRANSFER)
-        for tx in conn.execute(f"SELECT * FROM transactions WHERE id IN ({placeholders})", transaction_ids).fetchall():
-            cat, source = categorize(tx, rules, internal_id)
-            conn.execute(
-                "UPDATE transactions SET category_id = ?, category_source = ? WHERE account_id = ? AND id = ?",
-                (cat, source, tx["account_id"], tx["id"]),
-            )
+        conn.execute("UPDATE transactions SET category_source = 'none' WHERE id = ANY(%s)", (transaction_ids,))
+        recategorize(conn)
         return {"updated": len(found), "category": None, "note": "manual category cleared; rules re-applied"}
+
     cat_id = resolve_category(conn, category)
-    conn.execute(
-        f"UPDATE transactions SET category_id = ?, category_source = 'manual' WHERE id IN ({placeholders})",
-        [cat_id, *transaction_ids],
+    rules = _remember(conn, txs, cat_id) if remember else []
+    if rules:
+        recategorize(conn)
+    # Whatever the new rules didn't settle (all of them without remember) becomes a manual choice.
+    settled = " AND (category_id IS DISTINCT FROM %s OR category_source <> 'rule')" if rules else ""
+    manual = conn.execute(
+        "UPDATE transactions SET category_id = %s, category_source = 'manual', category_rule_id = NULL "
+        "WHERE id = ANY(%s)" + settled,
+        (cat_id, transaction_ids, cat_id) if rules else (cat_id, transaction_ids),
+    ).rowcount
+    name = conn.execute("SELECT name FROM categories WHERE id = %s", (cat_id,)).fetchone()[0]
+    return {"updated": len(found), "category": name, "rules_created": rules, "set_manually": max(manual, 0)}
+
+
+def _remember(conn: Connection, txs: list[Row], cat_id: int) -> list[dict[str, str]]:
+    """One user rule per (merchant, direction), replacing an existing user rule for the same merchant."""
+    merchants = sorted(
+        {(tx["payee_normalized"].strip(), "out" if tx["amount"] < 0 else "in") for tx in txs
+         if tx["payee_normalized"].strip() and not tx["is_internal_transfer"]}
     )
-    name = conn.execute("SELECT name FROM categories WHERE id = ?", (cat_id,)).fetchone()[0]
-    return {"updated": len(found), "category": name}
+    now = datetime.now().isoformat(timespec="seconds")
+    for name, direction in merchants:
+        conn.execute(
+            "DELETE FROM category_rules WHERE source = 'user' AND match_field = 'payee_normalized' "
+            "AND match_type = 'exact' AND lower(pattern) = lower(%s) AND direction = %s",
+            (name, direction),
+        )
+        conn.execute(
+            "INSERT INTO category_rules (match_field, match_type, pattern, category_id, direction, priority, source, "
+            "created_at) VALUES ('payee_normalized', 'exact', %s, %s, %s, %s, 'user', %s)",
+            (name, cat_id, direction, USER_PRIORITY, now),
+        )
+    return [{"merchant": name, "direction": direction} for name, direction in merchants]
 
 
-def list_rules(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def review_uncategorized(conn: Connection, include_guessed: bool = False, limit: int = 50) -> dict[str, Any]:
+    """Uncategorized transactions (and optionally history guesses) grouped by merchant and direction."""
+    rows = conn.execute(
+        """
+        SELECT t.id, t.date, t.amount, t.description, t.payee_normalized, t.pending, t.category_source,
+               a.name AS account, c.name AS category
+        FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN categories c ON c.id = t.category_id
+        WHERE NOT t.is_internal_transfer AND (t.category_id IS NULL OR (%s AND t.category_source = 'history'))
+        ORDER BY t.date DESC
+        """,
+        (include_guessed,),
+    ).fetchall()
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in rows:
+        direction = "out" if r["amount"] < 0 else "in"
+        g = groups.setdefault((r["payee_normalized"], direction), {
+            "merchant": r["payee_normalized"], "direction": direction, "count": 0, "total": 0.0,
+            "guessed_category": r["category"] if r["category_source"] == "history" else None,
+            "transaction_ids": [], "examples": [],
+        })
+        g["count"] += 1
+        g["total"] = round(g["total"] + r["amount"], 2)
+        g["transaction_ids"].append(r["id"])
+        if len(g["examples"]) < 3:
+            g["examples"].append({k: r[k] for k in ("date", "amount", "description", "account", "pending")})
+    ordered = sorted(groups.values(), key=lambda g: -abs(g["total"]))
+    by_kind: dict[str, list[str]] = {}
+    for c in conn.execute("SELECT name, kind FROM categories ORDER BY kind, name"):
+        by_kind.setdefault(c["kind"], []).append(c["name"])
+    return {"groups": ordered[:limit], "more_groups": max(len(ordered) - limit, 0), "categories": by_kind}
+
+
+def list_rules(conn: Connection) -> list[dict[str, Any]]:
+    """Rules in the order they run; `transactions` = how many this rule categorized (not its whole category)."""
     rows = conn.execute(
         """
         SELECT r.id, r.match_field, r.match_type, r.pattern, r.direction, c.name AS category, r.priority, r.source,
-               (SELECT COUNT(*) FROM transactions t WHERE t.category_id = r.category_id) AS category_transactions
-        FROM category_rules r JOIN categories c ON c.id = r.category_id ORDER BY r.priority, r.id
+               COUNT(t.id) AS transactions
+        FROM category_rules r JOIN categories c ON c.id = r.category_id
+        LEFT JOIN transactions t ON t.category_rule_id = r.id
+        GROUP BY r.id, c.name ORDER BY r.priority, r.id
         """
     ).fetchall()
     return [dict(r) for r in rows]
 
 
 def preview_rule(
-    conn: sqlite3.Connection, pattern: str, match_field: str = "payee_normalized", match_type: str = "exact",
+    conn: Connection, pattern: str, match_field: str = "payee_normalized", match_type: str = "exact",
     direction: str = "any", limit: int = 50,
 ) -> dict[str, Any]:
     """Preview which transactions a rule would match, without saving anything."""
@@ -350,21 +478,21 @@ def preview_rule(
 
 
 def add_rule(
-    conn: sqlite3.Connection, pattern: str, category: str, match_field: str = "payee_normalized",
+    conn: Connection, pattern: str, category: str, match_field: str = "payee_normalized",
     match_type: str = "exact", direction: str = "any", priority: int = USER_PRIORITY,
 ) -> dict[str, Any]:
     _validate_rule(match_field, match_type, pattern, direction)
     cat_id = resolve_category(conn, category)
-    cur = conn.execute(
+    rule_id = conn.execute(
         "INSERT INTO category_rules (match_field, match_type, pattern, category_id, direction, priority, source, "
-        "created_at) VALUES (?, ?, ?, ?, ?, ?, 'user', ?)",
+        "created_at) VALUES (%s, %s, %s, %s, %s, %s, 'user', %s) RETURNING id",
         (match_field, match_type, pattern, cat_id, direction, priority, datetime.now().isoformat(timespec="seconds")),
-    )
-    return {"rule_id": cur.lastrowid, **recategorize(conn)}
+    ).fetchone()[0]
+    return {"rule_id": rule_id, **recategorize(conn)}
 
 
-def delete_rule(conn: sqlite3.Connection, rule_id: int) -> dict[str, Any]:
-    row = conn.execute("SELECT source FROM category_rules WHERE id = ?", (rule_id,)).fetchone()
+def delete_rule(conn: Connection, rule_id: int) -> dict[str, Any]:
+    row = conn.execute("SELECT source FROM category_rules WHERE id = %s", (rule_id,)).fetchone()
     if not row:
         raise ToolError(f"No rule with id {rule_id}")
     if row["source"] != "user":
@@ -372,5 +500,5 @@ def delete_rule(conn: sqlite3.Connection, rule_id: int) -> dict[str, Any]:
             f"Rule {rule_id} is a {row['source']} rule. Override it with a user rule (lower priority number wins) "
             "or edit local_rules.json."
         )
-    conn.execute("DELETE FROM category_rules WHERE id = ?", (rule_id,))
+    conn.execute("DELETE FROM category_rules WHERE id = %s", (rule_id,))
     return {"deleted": rule_id, **recategorize(conn)}
