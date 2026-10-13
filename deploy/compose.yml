@@ -1,5 +1,6 @@
-# Lives next to .env and local_rules.json on the server (neither in git). See deploy/README.md.
-# .env must set FINANZAS_DOMAIN (e.g. finanzas.example.dev) plus the secrets listed in the README.
+# Lives next to .env, web.env and local_rules.json on the server (none in git). See deploy/README.md.
+# .env must set FINANZAS_DOMAIN and PANEL_DOMAIN (e.g. finanzas.example.dev, panel.example.dev) plus the
+# secrets listed in the README; web.env holds the web panel's own settings (see web/README.md).
 services:
   finanzas:
     build: .
@@ -18,6 +19,18 @@ services:
     mem_limit: 512m
     # No published ports: only Caddy reaches it.
 
+  web:
+    build: ./web
+    image: finanzas-web
+    container_name: finanzas-web
+    restart: unless-stopped
+    env_file: web.env
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 256m
+
   caddy:
     image: caddy:2-alpine
     container_name: finanzas-caddy
@@ -25,11 +38,12 @@ services:
     ports: ["80:80", "443:443"]
     environment:
       FINANZAS_DOMAIN: ${FINANZAS_DOMAIN}
+      PANEL_DOMAIN: ${PANEL_DOMAIN:?set PANEL_DOMAIN in .env}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
-    depends_on: [finanzas]
+    depends_on: [finanzas, web]
 
 volumes:
   caddy_data:

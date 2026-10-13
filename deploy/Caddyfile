@@ -1,11 +1,20 @@
-# HTTPS (automatic Let's Encrypt) in front of the MCP server. The domain comes from .env.
-{$FINANZAS_DOMAIN} {
-	reverse_proxy finanzas:8000 {
-		flush_interval -1  # stream MCP responses (SSE) without buffering
-	}
+# HTTPS (automatic Let's Encrypt) in front of the MCP server and the web panel. Domains come from .env.
+(common_headers) {
 	header {
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options nosniff
 		-Server
 	}
+}
+
+{$FINANZAS_DOMAIN} {
+	reverse_proxy finanzas:8000 {
+		flush_interval -1 # stream MCP responses (SSE) without buffering
+	}
+	import common_headers
+}
+
+{$PANEL_DOMAIN} {
+	reverse_proxy web:3100
+	import common_headers
 }

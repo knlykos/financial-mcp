@@ -16,3 +16,6 @@ data/
 # Local plan and personal rules (contain personal details)
 PLAN-finanzas-mcp.md
 local_rules.json
+
+# Web panel
+node_modules/
